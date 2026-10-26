@@ -1,0 +1,21 @@
+# 直连链路后端（可选）：独立实例 + 独立缓存，入口 TLS 交给 Caddy
+[Unit]
+Description=hajimi web gateway (direct)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=MIRROR_DOMAIN=hajimi-direct.example.com
+Environment=MIRROR_PORT=8325
+Environment=MIRROR_CACHE=/opt/hajimi/cache-direct
+Environment=HAJIMI_PWD=change-me
+Environment=FIREFOX_PROFILE=/home/admin/.mozilla/firefox-gemini
+Environment=UPSTREAM_PROXY=http://127.0.0.1:7890
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/hajimi
+ExecStart=/usr/bin/python3 /opt/hajimi/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

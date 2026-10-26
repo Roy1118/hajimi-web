@@ -1,0 +1,16 @@
+# 中转链路：家里服务器 -> 云主机隧道
+# ⭐ poolCount 必须调大：默认 1 条工作连接会被页面 300+ 并发打空，
+#   表现为间歇性整页 502；心跳缩短可把断线感知从 90s 压到 30s
+serverAddr = "your-cloud-server-ip"
+serverPort = 60022
+
+transport.poolCount = 30
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 30
+
+[[proxies]]
+name = "hajimi-web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8324
+remotePort = 60081

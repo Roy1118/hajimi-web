@@ -1,0 +1,20 @@
+# 中转链路后端（仅监听回环，前置隧道/反代）
+[Unit]
+Description=hajimi web gateway (relay)
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=MIRROR_DOMAIN=hajimi.example.com
+Environment=MIRROR_PORT=8324
+Environment=HAJIMI_PWD=change-me
+Environment=FIREFOX_PROFILE=/home/admin/.mozilla/firefox-gemini
+Environment=UPSTREAM_PROXY=http://127.0.0.1:7890
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt/hajimi
+ExecStart=/usr/bin/python3 /opt/hajimi/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

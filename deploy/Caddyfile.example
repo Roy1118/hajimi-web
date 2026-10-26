@@ -1,0 +1,15 @@
+# 直连入口：SNI 复用同一个 8443，路由器只需一条映射（外部 18443 -> 8443）
+# 加新站点零路由器改动，改完 systemctl reload caddy 即可
+{
+    servers {
+        protocols h1 h2
+    }
+}
+
+hajimi.example.com:8443 {
+    tls /etc/caddy/certs/example.com.pem /etc/caddy/certs/example.com.key
+    reverse_proxy 127.0.0.1:8325 {
+        # 关键：流式通道必须不缓冲，否则前端一直转圈
+        flush_interval -1
+    }
+}
