@@ -1,0 +1,201 @@
+
+    // 3. Intercept XMLHttpRequest
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {{
+        var rest = Array.prototype.slice.call(arguments, 2);
+        if (isBlocked(url)) {{
+            try {{ (window.__shieldLog = window.__shieldLog || []).push("XHR-BLOCK " + url); }} catch(e) {{}}
+            url = "/__mock_ok__?src=" + encodeURIComponent(url);
+        }} else {{
+            url = mapUrl(url);
+        }}
+        return _open.apply(this, [method, url].concat(rest));
+    }};
+
+    // 4. Intercept WebSocket
+    var _WS = window.WebSocket;
+    if (_WS) {{
+        window.WebSocket = function(url, protocols) {{
+            if (isBlocked(url)) {{
+                return {{
+                    readyState: 3,
+                    close: function() {{}},
+                    send: function() {{}},
+                    addEventListener: function() {{}},
+                    removeEventListener: function() {{}}
+                }};
+            }}
+            return protocols ? new _WS(url, protocols) : new _WS(url);
+        }};
+        window.WebSocket.prototype = _WS.prototype;
+    }}
+
+    // 5. Intercept HTMLIFrameElement src (阻断 accounts/ogs 挂死)
+    var iframeDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, "src");
+    if (iframeDesc && iframeDesc.set) {{
+        Object.defineProperty(HTMLIFrameElement.prototype, "src", {{
+            set: function(val) {{
+                if (isBlocked(val)) {{
+                    val = "about:blank";
+                }}
+                iframeDesc.set.call(this, val);
+            }},
+            get: iframeDesc.get
+        }});
+    }}
+
+    // 6. Intercept HTMLImageElement src & srcset
+    var imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src");
+    if (imgDesc && imgDesc.set) {{
+        Object.defineProperty(HTMLImageElement.prototype, "src", {{
+            set: function(val) {{
+                imgDesc.set.call(this, mapUrl(val));
+            }},
+            get: imgDesc.get
+        }});
+    }}
+    var srcsetDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "srcset");
+    if (srcsetDesc && srcsetDesc.set) {{
+        Object.defineProperty(HTMLImageElement.prototype, "srcset", {{
+            set: function(val) {{
+                srcsetDesc.set.call(this, mapUrl(val));
+            }},
+            get: srcsetDesc.get
+        }});
+    }}
+
+    // 7. Intercept Element.setAttribute
+    var origSetAttr = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, val) {{
+        if (typeof val === "string") {{
+            var n = name.toLowerCase();
+            if (n === "src" || n === "href" || n === "srcset" || n === "style") {{
+                if (isBlocked(val)) {{
+                    val = "about:blank";
+                }} else {{
+                    val = mapUrl(val);
+                }}
+            }}
+        }}
+        return origSetAttr.call(this, name, val);
+    }};
+
+    // 8. Intercept CSSStyleDeclaration
+    var origSetProp = CSSStyleDeclaration.prototype.setProperty;
+    if (origSetProp) {{
+        CSSStyleDeclaration.prototype.setProperty = function(prop, val, pri) {{
+            if (typeof val === "string") {{
+                val = mapUrl(val);
+            }}
+            return origSetProp.call(this, prop, val, pri);
+        }};
+    }}
+    var bgProp = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, "backgroundImage");
+    if (bgProp && bgProp.set) {{
+        Object.defineProperty(CSSStyleDeclaration.prototype, "backgroundImage", {{
+            set: function(val) {{
+                bgProp.set.call(this, mapUrl(val));
+            }},
+            get: bgProp.get
+        }});
+    }}
+    var cssTextProp = Object.getOwnPropertyDescriptor(CSSStyleDeclaration.prototype, "cssText");
+    if (cssTextProp && cssTextProp.set) {{
+        Object.defineProperty(CSSStyleDeclaration.prototype, "cssText", {{
+            set: function(val) {{
+                cssTextProp.set.call(this, mapUrl(val));
+            }},
+            get: cssTextProp.get
+        }});
+    }}
+
+    // 8.5 MutationObserver 兜底：innerHTML 插入的图片会绕过属性补丁
+    function __fixImgEl(el) {{
+        try {{
+            if (!el || el.nodeType !== 1) return;
+            var tag = el.tagName;
+            if (tag === "IMG" || tag === "SOURCE") {{
+                var v = el.getAttribute("src");
+                if (v && v.indexOf("google") !== -1) el.setAttribute("src", mapUrl(v));
+                var ss = el.getAttribute("srcset");
+                if (ss && ss.indexOf("google") !== -1) el.setAttribute("srcset", mapUrl(ss));
+            }}
+            if (el.querySelectorAll) {{
+                var list = el.querySelectorAll("img,source");
+                for (var i = 0; i < list.length; i++) {{
+                    var v2 = list[i].getAttribute("src");
+                    if (v2 && v2.indexOf("google") !== -1) list[i].setAttribute("src", mapUrl(v2));
+                    var s2 = list[i].getAttribute("srcset");
+                    if (s2 && s2.indexOf("google") !== -1) list[i].setAttribute("srcset", mapUrl(s2));
+                }}
+            }}
+        }} catch(e) {{}}
+    }}
+    try {{
+        new MutationObserver(function(muts) {{
+            for (var i = 0; i < muts.length; i++) {{
+                var ns = muts[i].addedNodes;
+                for (var j = 0; j < ns.length; j++) __fixImgEl(ns[j]);
+            }}
+        }}).observe(document.documentElement, {{ childList: true, subtree: true }});
+        document.addEventListener("DOMContentLoaded", function() {{ __fixImgEl(document.documentElement); }});
+
+        // Shadow DOM 里的图片 MutationObserver 进不去，单独挂监听
+        var __observeRoot = function(root) {{
+            try {{
+                new MutationObserver(function(muts) {{
+                    for (var i = 0; i < muts.length; i++) {{
+                        var ns = muts[i].addedNodes;
+                        for (var j = 0; j < ns.length; j++) __fixImgEl(ns[j]);
+                    }}
+                }}).observe(root, {{ childList: true, subtree: true }});
+            }} catch(e) {{}}
+        }};
+        var __origAttach = Element.prototype.attachShadow;
+        Element.prototype.attachShadow = function(init) {{
+            var root = __origAttach.call(this, init);
+            __observeRoot(root);
+            return root;
+        }};
+        // 兜底：周期性全量扫描（含 shadow root），覆盖 worker/延迟创建等场景
+        var __deepFix = function(root, depth) {{
+            if (!root || depth > 8) return;
+            try {{
+                __fixImgEl(root);
+                var kids = root.querySelectorAll ? root.querySelectorAll("*") : [];
+                for (var i = 0; i < kids.length; i++) {{
+                    if (kids[i].shadowRoot) __deepFix(kids[i].shadowRoot, depth + 1);
+                }}
+            }} catch(e) {{}}
+        }};
+        // 兜底 2：内联样式与 <style> 里的 Google 图片地址（CSS 背景图不走属性补丁）
+        var __fixCss = function(text) {{
+            if (!text || text.indexOf("google") === -1) return text;
+            return text.replace(/https?:\\/\\/(lh3\.googleusercontent\.com|lh3\.google\.com|lh[0-9]\.googleusercontent\.com)/g, origin + "/_lh3_usercontent_")
+                       .replace(/https?:\\/\\/fonts\.gstatic\.com/g, origin + "/_fonts_gstatic_")
+                       .replace(/https?:\\/\\/fonts\.googleapis\.com/g, origin + "/_fonts_api_")
+                       .replace(/https?:\\/\\/ssl\.gstatic\.com/g, origin + "/_ssl_gstatic_")
+                       .replace(/https?:\\/\\/www\.gstatic\.com/g, origin + "/_www_gstatic_")
+                       .replace(/https?:\\/\\/gemini\.gstatic\.com/g, origin + "/_gstatic_");
+        }};
+        var __sweepStyle = function() {{
+            try {{
+                var all = document.querySelectorAll('[style],[data-style]');
+                for (var i = 0; i < all.length; i++) {{
+                    var sv = all[i].getAttribute("style");
+                    if (sv && sv.indexOf("google") !== -1) {{
+                        var nv = __fixCss(sv);
+                        if (nv !== sv) all[i].setAttribute("style", nv);
+                    }}
+                }}
+                var st = document.querySelectorAll("style");
+                for (var j = 0; j < st.length; j++) {{
+                    var css = st[j].textContent;
+                    if (css && css.indexOf("google") !== -1) {{
+                        var nc = __fixCss(css);
+                        if (nc !== css) st[j].textContent = nc;
+                    }}
+                }}
+            }} catch(e) {{}}
+        }};
+        setInterval(__sweepStyle, 2500);

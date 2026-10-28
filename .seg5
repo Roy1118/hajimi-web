@@ -1,0 +1,214 @@
+
+        if self.path == "/":
+            self.send_response(302)
+            self.send_header("Location", "/app")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        self.handle_proxy("GET")
+
+    def do_OPTIONS(self):
+        self._body_read = False
+        self._body = None
+        self._drain_body()
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
+        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header("Access-Control-Allow-Credentials", "true")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def handle_proxy(self, method):
+        path = self.path
+
+        # 拦截残留的遥测/打点请求，秒回 200
+        if any(x in path for x in ["ccm/collect", "$rpc/google.internal.waa", "punctual/v1/chooseServer", "play.google.com", "google-analytics"]):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(MOCK_RESPONSE_BODY)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.end_headers()
+            self.wfile.write(MOCK_RESPONSE_BODY)
+            self.wfile.flush()
+            return
+
+        # 映射上游主机与路径
+        target_host = "gemini.google.com"
+        target_path = path
+
+        if path.startswith("/_gstatic_/"):
+            target_host = "gemini.gstatic.com"
+            target_path = path[len("/_gstatic_"):]
+        elif path.startswith("/_static_/"):
+            target_host = "gemini.gstatic.com"
+            target_path = path[len("/_static_"):]
+        elif path.startswith("/_static/"):
+            target_host = "gemini.gstatic.com"
+            target_path = path[len("/_static"):]
+        elif path.startswith("/_www_gstatic_/"):
+            target_host = "www.gstatic.com"
+            target_path = path[len("/_www_gstatic_"):]
+        elif path.startswith("/_fonts_gstatic_/"):
+            target_host = "fonts.gstatic.com"
+            target_path = path[len("/_fonts_gstatic_"):]
+        elif path.startswith("/_fonts_api_/"):
+            target_host = "fonts.googleapis.com"
+            target_path = path[len("/_fonts_api_"):]
+        elif path.startswith("/_ssl_gstatic_/"):
+            target_host = "ssl.gstatic.com"
+            target_path = path[len("/_ssl_gstatic_"):]
+        elif path.startswith("/_lh3_/"):
+            # 注意：/_lh3_ 前缀对应 lh3.google.com（与前端 shim 的 lh3.google.com 分支一致），
+            # 不能指向 lh3.googleusercontent.com，否则 rd-gg 等图片会 404。
+            target_host = "lh3.google.com"
+            target_path = path[len("/_lh3_"):]
+        elif path.startswith("/_lh3_usercontent_/"):
+            target_host = "lh3.googleusercontent.com"
+            target_path = path[len("/_lh3_usercontent_"):]
+        elif path.startswith("/_geminiweb_pa_/"):
+            target_host = "geminiweb-pa.clients6.google.com"
+            target_path = path[len("/_geminiweb_pa_"):]
+        elif path.startswith("/_gg_/"):
+            _rest = path[len("/_gg_/"):]
+            _slash = _rest.find("/")
+            if _slash == -1:
+                _h, _rp = _rest, "/"
+            else:
+                _h, _rp = _rest[:_slash], _rest[_slash:]
+            if not re.match(r"^[a-z0-9.-]+\.(clients6\.google\.com|googleusercontent\.com|googleapis\.com|google\.com|gstatic\.com)$", _h, re.I):
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # 账号/组件类直连会挂 21~31s，直接秒回空
+            if _h in ("ogs.google.com", "accounts.google.com", "play.google.com"):
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            target_host = _h
+            target_path = _rp
+        elif path.startswith("/_waa_pa_/"):
+            target_host = "waa-pa.clients6.google.com"
+            target_path = path[len("/_waa_pa_"):]
+        elif path.startswith("/_signaler_pa_/"):
+            target_host = "signaler-pa.clients6.google.com"
+            target_path = path[len("/_signaler_pa_"):]
+        elif path.startswith("/_push_clients6_/"):
+            target_host = "push.clients6.google.com"
+            target_path = path[len("/_push_clients6_"):]
+
+        upstream_url = f"https://{target_host}{target_path}"
+
+        # 判定是否属于静态资源
+        is_static = any(path.startswith(p) for p in [
+            "/_gstatic_/", "/_www_gstatic_/", "/_fonts_gstatic_/", "/_fonts_api_/",
+            "/_ssl_gstatic_/", "/_static_/", "/_static/", "/_lh3_/", "/_lh3_usercontent_/", "/_gg_/"
+        ]) or any(
+            ext in target_path for ext in [".js", ".css", ".woff2", ".ttf", ".svg", ".png", ".jpg", ".webp", ".ico", ".wasm"]
+        )
+
+        cache_key = hashlib.md5(upstream_url.encode("utf-8")).hexdigest()
+        cache_file = os.path.join(CACHE_DIR, cache_key)
+
+        # 内存 -> 磁盘缓存直接命中（0 毫秒直出）
+        if method == "GET" and is_static:
+            if upstream_url in STATIC_MEM_CACHE:
+                ct, body = STATIC_MEM_CACHE[upstream_url]
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if method != "HEAD":
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                return
+
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file + ".meta", "r") as mf:
+                        ct = mf.read().strip()
+                    with open(cache_file, "rb") as cf:
+                        body = cf.read()
+                    STATIC_MEM_CACHE[upstream_url] = (ct, body)
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    if method != "HEAD":
+                        self.wfile.write(body)
+                        self.wfile.flush()
+                    return
+                except Exception:
+                    pass
+
+        if "upload" in path:
+            _b = getattr(self, "_body", b"") or b""
+            sys.stderr.write(f"[UPLOAD] {method} {path[:120]} te={self.headers.get('Transfer-Encoding','-')} "
+                             f"cl={self.headers.get('Content-Length','-')} body={len(_b)}B hex={_b[:60].hex()}\n")
+        # 使用已缓存的请求体（do_POST/do_GET 开头已读取，不会残留）
+        req_body = getattr(self, "_body", None)
+        if not getattr(self, "_body_read", False):
+            req_body = self._drain_body() if method in ("POST", "PUT", "PATCH") else None
+
+        # 构造上游请求头：白名单（与「会话能正常落库」时期的转发一致）。
+        # ⚠️ 不要把浏览器自带的 x-goog-ext-* / x-client-data / sec-ch-ua 透给 Google：
+        # 那是「浏览器客户端身份」，与服务端 Cookie 混用会让写请求被当成匿名客户端，
+        # 表现为「能拿到回复文本，但新会话不进列表、URL 不跳转、远程桌面上也看不到」。
+        # 上传接口额外放行 x-goog-upload-*（Google 上传协议必需），否则文件传不上去。
+        forward_headers = {
+            "Host": target_host,
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0",
+            "Accept": self.headers.get("Accept", "*/*"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://gemini.google.com/",
+            "Origin": "https://gemini.google.com",
+            "X-Same-Domain": "1",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        # 上传头已合并到上面的 x-goog-* 转发
+
+        if target_host.endswith(".google.com") or target_host in ("gemini.google.com",):
+            cookie_str = get_cookies_str(target_host)
+            if cookie_str:
+                forward_headers["Cookie"] = cookie_str
+                # 客户端身份 blob（浏览器生成的 x-goog-ext-* / 账号索引）必须透传，
+                # 否则服务端把写请求当成「未注册客户端」→ 临时会话（能回复但不落库）。
+                # 转发所有 x-goog-* 头（ext 为客户端身份，upload 为上传协议，缺一不可）
+                for _k, _v in self.headers.items():
+                    if _k.lower().startswith("x-goog-"):
+                        forward_headers[_k] = _v
+                # 上传请求：额外转发所有原始头（黑名单），确保不丢任何 Google 上传协议需要的头
+                if "upload" in path:
+                    _skip = {"host","connection","proxy-connection","keep-alive","te","trailer",
+                             "transfer-encoding","upgrade","cookie","content-length","accept-encoding"}
+                    for _k, _v in self.headers.items():
+                        if _k.lower() not in _skip and _k not in forward_headers:
+                            forward_headers[_k] = _v
+                # SAPISIDHASH：浏览器只有在 google.com 域下才会自己算；镜像域名下必须由我们算。
+                # 这是 Google 区分「真实浏览器会话」与「API/临时会话」的关键凭证。
+                try:
+                    _ck = dict(x.split("=", 1) for x in cookie_str.split("; ") if "=" in x)
+                    _sid = _ck.get("SAPISID") or _ck.get("__Secure-1PAPISID") or _ck.get("APISID")
+                    if _sid and ("batchexecute" in path or "processSession" in path or method in ("POST", "PUT")):
+                        forward_headers["Authorization"] = make_sapisidhash(_sid)
+                        sys.stderr.write(f"[AUTH-HASH] {path[:50]} 已注入 SAPISIDHASH\n")
+                except Exception as _e:
+                    sys.stderr.write(f"[AUTH-HASH] 计算失败: {_e}\n")
+
+        ct = self.headers.get("Content-Type")
+        if ct:
+            forward_headers["Content-Type"] = ct
+        # 关键：Google 的 RPC 靠 Authorization: SAPISIDHASH（浏览器按 Cookie 实时签名）区分登录/游客。
+        # 这个头必须原样转发，丢了就会「读得到历史、写是游客态」（降智 + 会话不保存）。
+        authz = self.headers.get("Authorization")
+        if authz:
+            forward_headers["Authorization"] = authz
+        sys.stderr.write(f"[AUTH] {method} {path[:60]} auth={'YES ' + authz[:22] if authz else 'NO'}\n")
