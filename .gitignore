@@ -5,3 +5,4 @@ certs/
 .env
 out/
 *.bak*
+.seg*
