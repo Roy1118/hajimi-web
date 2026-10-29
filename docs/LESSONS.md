@@ -63,6 +63,44 @@ def make_sapisidhash(sapisid, origin):
 - 一个 8443 端口服务多个域名：Caddy 按 TLS SNI 分流，路由器只需一条映射，加新站点零路由器改动
 - 内网机器访问自己的公网域名不通 ≠ 外网不通，先排除 hairpin NAT 再排查
 
+## 8. 流式透传最忌「聚合缓冲」：chunk_size 设大了，前端会一直转圈
+
+**症状**：发消息后界面长时间停在"思考中"，但刷新页面答案早就生成好了（说明上游早算完，是流没送出去）。
+
+**根因**：流式读取用 `resp.iter_bytes(chunk_size=4096)`。httpx 的 ByteChunker 会**攒够 4096 字节才吐出一次**；而思考阶段的增量帧只有几百字节 → 一个字节都不转发 → 前端零反馈；等正文生成完（大块）才一次性到达。同时默认 `Timeout(120)` 会在深度思考超 2 分钟时把连接掐断。
+
+**修法**：`chunk_size=1`（收到即转发）；`Timeout(600, connect=15, read=600, write=120, pool=60)`；并在流式分支打 `[STREAM] first_byte=…ms total=…ms` 日志，下次卡顿时一眼定位卡在哪一段。
+
+## 9. 媒体下载三个连环坑（静态缓存 / 手工 chunked / fetch(URL)）
+
+**症状**：视频能预览播放，点"下载"却报错；或请求到了本站却 `ERR_HTTP2_PROTOCOL_ERROR`。
+
+1. **被当静态资源**：`/_gg_/` 若归类为静态，会把整个视频读进内存并写磁盘缓存。修：判定媒体下载（路径含 `/download` 或 host 以 `contribution.usercontent.` 开头）→ 排除静态缓存。
+2. **手工 chunked 与解压长度不一致**：上游 gzip/br 被 httpx 解压后，手工声明的 `Content-Length` 与实际字节数不符 → 前置代理转 HTTP/2 时直接判协议错误。修：媒体下载走普通分支（全量读完按 `len(body)` 声明），或透传 `content-encoding` 配 `iter_raw()`。
+3. **`fetch(new URL(...))` 被漏掉**：只认 `string` 和 `Request` 的 `input.url` 不够——`URL` 对象只有 `.href`，取不到 URL 就静默不改写 → 直连上游超时。修：`input.url || input.href || String(input)`，且 `new Request()` 失败时退化为字符串 URL，**绝不回落到上游绝对地址**。
+
+**附带**：原生 `<a download>` 不经过 `fetch`/`XHR`，必须单独拦截（click/pointerdown 捕获 + MutationObserver + `composedPath()` 穿透 Shadow DOM）。
+
+## 10. 并发首调竞态：`global` 变量名与定义不一致 → 偶发 502
+
+**症状**：偶发 `502 Bad Gateway`，日志里有 `NameError: name 'CACHED_XXX' is not defined`。
+
+**根因**：缓存函数先更新时间戳再读库；并发首调时 B 线程看到"时间戳已更新"但缓存仍为空，去读一个**从未定义**的全局变量（定义处写的是另一个名字）→ 抛异常 → 响应中断。
+
+**修法**：变量名统一 + `threading.Lock()` 加锁 + 双重检查；读库逻辑拆到独立函数。凡"时间戳 + 缓存"结构都要防这个窗口。
+
+## 11. 域名改写覆盖面：地区域与 `.goog` 域
+
+上游会在不同场景使用 `www.google.co.kr`、`www.google.com.hk`（地区域）、`<uuid>.scf.usercontent.goog`（交互式 Applet 的 iframe）等域名。只覆盖 `google.com` / `googleusercontent.com` 会漏：
+
+- 地区域：`google\.(com|co\.[a-z]{2}|com\.[a-z]{2})`
+- `.goog` 域：`[a-z0-9.-]+\.usercontent\.goog`
+- **服务端路径白名单也要同步放行**，否则前端改写了、服务端仍 404
+
+**注意**：iframe 里的内容是独立文档，主页面补丁进不去；把 iframe 的 `src` 改写到本站前缀后，它内部相对路径自然同源，服务端再对该 HTML 注入补丁即可。
+
+---
+
 ## 7. 生态坑：临时目录被核心清理机制删掉
 
 某 bot 框架的核心自带临时目录清理器（超配额按最旧删文件），删完还会**把清空的子目录 rmdir 掉**；而插件保存文件时不重建目录 → 偶发"No such file or directory"、重启即愈、循环复发。修法：保存前 `os.makedirs(..., exist_ok=True)`。凡是"写临时目录"的插件都要防这一手。

@@ -11,6 +11,7 @@
 3. 补齐 /favicon.ico 204 秒回，消灭控制台报错
 """
 
+import threading
 import os
 import sys
 import time
@@ -43,7 +44,8 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 GLOBAL_CLIENT = httpx.Client(
     proxy=UPSTREAM_PROXY,
     http2=False,  # 必须关闭：httpcore 同步 HTTP/2 在多线程下共用连接会 ReadError(EAGAIN)
-    timeout=httpx.Timeout(120.0, connect=15.0),
+    # 2026-10-29: read 120s 会掐断深度思考（Pro 思考常 >2min），表现为「卡在思考中」后整包失败
+    timeout=httpx.Timeout(600.0, connect=15.0, read=600.0, write=120.0, pool=60.0),
     limits=httpx.Limits(max_keepalive_connections=100, max_connections=200, keepalive_expiry=120.0),
     follow_redirects=False
 )
@@ -55,25 +57,58 @@ CACHED_COOKIE_STR = ""
 LAST_COOKIE_MTIME = 0
 LAST_COOKIE_CHECK = 0
 
-def _load_cookies():
-    """从 Firefox profile 读取全部 google 域 Cookie，按 host 建索引。返回 {host: [(name,value)]}。"""
-    global CACHED_COOKIES, LAST_COOKIE_MTIME, LAST_COOKIE_CHECK
-    now = time.time()
-    if now - LAST_COOKIE_CHECK < 5.0 and CACHED_COOKIES:
-        return CACHED_COOKIES
+_COOKIE_LOCK = threading.Lock()
 
-    LAST_COOKIE_CHECK = now
+def _load_cookies():
+    """从 Firefox profile 读取全部 google 域 Cookie，按 host 建索引。返回 {host: [(name,value)]}。
+
+    2026-10-29: 原实现先更新时间戳再读库，并发首调时另一线程会读到「已更新时间戳但缓存仍空」
+    → NameError: CACHED_COOKIES（变量名与定义不符）→ 请求中断 → Caddy 502。
+    这里统一变量名并加锁 + 双重检查，彻底消除竞态。
+    """
+    global CACHED_COOKIE_STR, LAST_COOKIE_MTIME, LAST_COOKIE_CHECK
+    now = time.time()
+    if now - LAST_COOKIE_CHECK < 5.0 and CACHED_COOKIE_STR:
+        return CACHED_COOKIE_STR
+
+    with _COOKIE_LOCK:
+        now = time.time()
+        if now - LAST_COOKIE_CHECK < 5.0 and CACHED_COOKIE_STR:
+            return CACHED_COOKIE_STR
+        LAST_COOKIE_CHECK = now
+        return _load_cookies_locked()
+
+
+def _load_cookies_locked():
+    global CACHED_COOKIE_STR, LAST_COOKIE_MTIME
     db_path = os.path.join(FIREFOX_PROFILE, "cookies.sqlite")
     if not os.path.exists(db_path):
-        return CACHED_COOKIES
+        return CACHED_COOKIE_STR
 
     try:
         mtime = os.path.getmtime(db_path)
-        if mtime == LAST_COOKIE_MTIME and CACHED_COOKIES:
-            return CACHED_COOKIES
+        # 2026-10-29: Firefox 用 WAL 模式，新 cookie 先落 -wal、主库 mtime 不变。
+        # 只看主库 mtime 会让缓存永不刷新，读到过期 1PSIDTS → 上游判未登录。
+        try:
+            wal_m = os.path.getmtime(db_path + "-wal")
+            if wal_m > mtime:
+                mtime = wal_m
+        except OSError:
+            pass
+        if mtime == LAST_COOKIE_MTIME and CACHED_COOKIE_STR:
+            return CACHED_COOKIE_STR
 
         tmp_path = "/tmp/hajimi_cookie_sync.db"
-        shutil.copy2(db_path, tmp_path)
+        # 必须连 -wal/-shm 一起拷，否则读到的是未合并的旧值
+        for _ext in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_path + _ext)
+            except Exception:
+                pass
+        for _ext in ("", "-wal", "-shm"):
+            _src = db_path + _ext
+            if os.path.exists(_src):
+                shutil.copy2(_src, tmp_path + _ext)
         conn = sqlite3.connect(tmp_path, timeout=5)
         cur = conn.cursor()
         cur.execute("SELECT name, value, host FROM moz_cookies WHERE host LIKE ?", ("%google.com%",))
@@ -85,12 +120,12 @@ def _load_cookies():
             os.remove(tmp_path)
         except Exception:
             pass
-        CACHED_COOKIES = data
+        CACHED_COOKIE_STR = data
         LAST_COOKIE_MTIME = mtime
         return data
     except Exception as e:
         sys.stderr.write(f"[COOKIE] 读取失败: {e}\n")
-        return CACHED_COOKIES
+        return CACHED_COOKIE_STR
 
 
 def get_cookies_str(target_host=""):
@@ -196,7 +231,7 @@ SHIELD_SCRIPT = f"""<script>
                 return s.replace(/https?:\\/\\/www\\.gstatic\\.com/g, origin + "/_www_gstatic_");
             }}
             // 通用兜底：任意 *.clients6.google.com / googleusercontent / googleapis / google.com / gstatic 子域
-            var gm = s.match(/^(?:https?:)?\\/\\/([a-z0-9.-]+\\.(?:clients6\\.google\\.com|googleusercontent\\.com|googleapis\\.com|google\\.com|gstatic\\.com))(.*)$/i);
+            var gm = s.match(/^(?:https?:)?\\/\\/([a-z0-9.-]+\\.(?:clients6\\.google\\.com|googleusercontent\\.com|usercontent\\.goog|googleapis\\.com|google\\.co\\.[a-z]{2}|google\\.com\\.[a-z]{2}|google\\.com|gstatic\\.com))(.*)$/i);
             if (gm) {{
                 return origin + "/_gg_/" + gm[1] + (gm[2] || "");
             }}
@@ -218,7 +253,12 @@ SHIELD_SCRIPT = f"""<script>
     // 2. Intercept window.fetch
     var _fetch = window.fetch;
     window.fetch = function(input, init) {{
-        var u = typeof input === "string" ? input : (input && input.url ? input.url : "");
+        // 2026-10-29: 原实现只认 string 和 Request；fetch(new URL(...)) 时 .url 为空 → 不改写 → 直连上游超时。
+        var u = "";
+        try {{
+            if (typeof input === "string") u = input;
+            else if (input && typeof input === "object") u = input.url || input.href || String(input);
+        }} catch(e) {{ u = ""; }}
         if (isBlocked(u)) {{
             try {{ (window.__shieldLog = window.__shieldLog || []).push("FETCH-BLOCK " + u); }} catch(e) {{}}
             return Promise.resolve(new Response(JSON.stringify({{
@@ -233,11 +273,17 @@ SHIELD_SCRIPT = f"""<script>
             }}));
         }}
         var mapped = mapUrl(u);
-        if (mapped !== u) {{
+        if (mapped && u && mapped !== u) {{
+            try {{ (window.__shieldLog = window.__shieldLog || []).push("FETCH-REWRITE " + String(u).slice(0, 80)); }} catch(e) {{}}
+            var _done = false;
             if (typeof input === "string") {{
-                input = mapped;
+                input = mapped; _done = true;
             }} else if (input && typeof input === "object") {{
-                try {{ input = new Request(mapped, init); }} catch(e) {{}}
+                try {{ input = new Request(mapped, init); _done = true; }} catch(e) {{ _done = false; }}
+            }}
+            if (!_done) {{
+                // Request 构造失败（URL 对象 / signal 异常等）→ 退化成字符串 URL，绝不回落到上游绝对地址
+                try {{ input = mapped; }} catch(e) {{}}
             }}
         }}
         return _fetch.call(this, input, init);
@@ -247,6 +293,7 @@ SHIELD_SCRIPT = f"""<script>
     var _open = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {{
         var rest = Array.prototype.slice.call(arguments, 2);
+        try {{ url = (typeof url === "string") ? url : String(url); }} catch(e) {{}}
         if (isBlocked(url)) {{
             try {{ (window.__shieldLog = window.__shieldLog || []).push("XHR-BLOCK " + url); }} catch(e) {{}}
             url = "/__mock_ok__?src=" + encodeURIComponent(url);
@@ -254,6 +301,85 @@ SHIELD_SCRIPT = f"""<script>
             url = mapUrl(url);
         }}
         return _open.apply(this, [method, url].concat(rest));
+    }};
+
+    // 3.5 原生下载改写（2026-10-29）：<a download> 不经过 fetch/XHR，
+    //     上游媒体域名（contribution.usercontent / lh3.googleusercontent）会直连超时。
+    //     这里在捕获阶段把 href 换成本站 /_gg_/ 前缀，同源下载即可走镜像。
+    function rewriteAnchor(a) {{
+        try {{
+            var raw = a.getAttribute("href") || a.href || "";
+            if (!raw || raw.indexOf(origin) === 0) return false;
+            var mapped = mapUrl(raw);
+            if (mapped && mapped !== raw) {{
+                a.setAttribute("href", mapped);
+                try {{ (window.__shieldLog = window.__shieldLog || []).push("DL-REWRITE " + mapped.slice(0, 90)); }} catch(e) {{}}
+                return true;
+            }}
+        }} catch(e) {{}}
+        return false;
+    }}
+    // ⚠️ Google 新 UI 大量使用 Shadow DOM：e.target 是 shadow host，closest() 拿不到里面的 <a>。
+    //    必须走 composedPath() 穿透 shadow 边界，否则「下载」按钮永远改写不到。
+    function findAnchor(e) {{
+        try {{
+            var path = (e.composedPath && e.composedPath()) || [];
+            for (var i = 0; i < path.length; i++) {{
+                var n = path[i];
+                if (n && n.tagName === "A" && n.getAttribute) return n;
+            }}
+        }} catch(x) {{}}
+        var t = e.target;
+        try {{ return t && t.closest ? t.closest("a[href]") : null; }} catch(x) {{ return null; }}
+    }}
+    ["click", "pointerdown", "mousedown", "auxclick"].forEach(function(ev) {{
+        document.addEventListener(ev, function(e) {{
+            var a = findAnchor(e);
+            if (a) rewriteAnchor(a);
+        }}, true);
+    }});
+    // shadow root 也需要单独观察 + 改写（document 的 observer 进不去 shadow 树）
+    function scanShadow(root) {{
+        try {{
+            var as = root.querySelectorAll ? root.querySelectorAll("a[href]") : [];
+            for (var i = 0; i < as.length; i++) rewriteAnchor(as[i]);
+            var all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+            for (var j = 0; j < all.length; j++) {{
+                var sr = all[j].shadowRoot;
+                if (sr && !sr.__hajimiObs) {{
+                    sr.__hajimiObs = true;
+                    scanShadow(sr);
+                    try {{
+                        new MutationObserver(function(muts, obs) {{
+                            scanShadow(obs.__root || sr);
+                        }}).observe(sr, {{childList: true, subtree: true}});
+                    }} catch(x) {{}}
+                }}
+            }}
+        }} catch(x) {{}}
+    }}
+    setInterval(function() {{ scanShadow(document); }}, 1200);
+    try {{
+        new MutationObserver(function(muts) {{
+            for (var i = 0; i < muts.length; i++) {{
+                var nodes = muts[i].addedNodes || [];
+                for (var j = 0; j < nodes.length; j++) {{
+                    var n = nodes[j];
+                    if (!n || n.nodeType !== 1) continue;
+                    if (n.tagName === "A") rewriteAnchor(n);
+                    if (n.querySelectorAll) {{
+                        var as = n.querySelectorAll("a[href]");
+                        for (var k = 0; k < as.length; k++) rewriteAnchor(as[k]);
+                    }}
+                }}
+            }}
+        }}).observe(document.documentElement, {{childList: true, subtree: true}});
+    }} catch(e) {{}}
+    var _winOpen = window.open;
+    window.open = function(u) {{
+        var args = Array.prototype.slice.call(arguments);
+        if (u) args[0] = mapUrl(u);
+        return _winOpen.apply(window, args);
     }};
 
     // 4. Intercept WebSocket
@@ -552,7 +678,7 @@ SHIELD_MINIMAL = r"""<script>
             if (s.indexOf("ssl.gstatic.com") !== -1) return s.replace(/https?:\/\/ssl\.gstatic\.com/g, origin + "/_ssl_gstatic_").replace(/\/\/ssl\.gstatic\.com/g, origin + "/_ssl_gstatic_");
             if (s.indexOf("gemini.gstatic.com") !== -1) return s.replace(/https?:\/\/gemini\.gstatic\.com/g, origin + "/_gstatic_");
             if (s.indexOf("www.gstatic.com") !== -1) return s.replace(/https?:\/\/www\.gstatic\.com/g, origin + "/_www_gstatic_");
-            var gm = s.match(/^(?:https?:)?\/\/([a-z0-9.-]+\.(?:clients6\.google\.com|googleusercontent\.com|googleapis\.com|google\.com|gstatic\.com))(.*)$/i);
+            var gm = s.match(/^(?:https?:)?\/\/([a-z0-9.-]+\.(?:clients6\.google\.com|googleusercontent\.com|usercontent\.goog|googleapis\.com|google\.co\.[a-z]{2}|google\.com\.[a-z]{2}|google\.com|gstatic\.com))(.*)$/i);
             if (gm) return origin + "/_gg_/" + gm[1] + (gm[2] || "");
             return s;
         } catch(e) { return u; }
@@ -647,7 +773,7 @@ def remap_google_url(u):
     for pre, rep in pairs:
         if u.startswith(pre):
             return f"https://{DOMAIN}{rep}" + u[len(pre):]
-    m = re.match(r"^https?://([a-z0-9.-]+\.(?:clients6\.google\.com|googleusercontent\.com|googleapis\.com|google\.com|gstatic\.com))(.*)$", u, re.I)
+    m = re.match(r"^https?://([a-z0-9.-]+\.(?:clients6\.google\.com|googleusercontent\.com|usercontent\.goog|googleapis\.com|google\.co\.[a-z]{2}|google\.com\.[a-z]{2}|google\.com|gstatic\.com))(.*)$", u, re.I)
     if m:
         return f"https://{DOMAIN}/_gg_/{m.group(1)}{m.group(2)}"
     return u
@@ -958,7 +1084,7 @@ class FastProxyHandler(BaseHTTPRequestHandler):
                 _h, _rp = _rest, "/"
             else:
                 _h, _rp = _rest[:_slash], _rest[_slash:]
-            if not re.match(r"^[a-z0-9.-]+\.(clients6\.google\.com|googleusercontent\.com|googleapis\.com|google\.com|gstatic\.com)$", _h, re.I):
+            if not re.match(r"^[a-z0-9.-]+\.(clients6\.google\.com|googleusercontent\.com|usercontent\.goog|googleapis\.com|google\.co\.[a-z]{2}|google\.com\.[a-z]{2}|google\.com|gstatic\.com)$", _h, re.I):
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -984,7 +1110,9 @@ class FastProxyHandler(BaseHTTPRequestHandler):
         upstream_url = f"https://{target_host}{target_path}"
 
         # 判定是否属于静态资源
-        is_static = any(path.startswith(p) for p in [
+        # 2026-10-29: 媒体下载（视频/大文件）绝不入静态缓存：体积大、要支持 Range/206
+        _is_media_dl = ("/download" in target_path) or target_host.startswith("contribution.usercontent.")
+        is_static = (not _is_media_dl) and any(path.startswith(p) for p in [
             "/_gstatic_/", "/_www_gstatic_/", "/_fonts_gstatic_/", "/_fonts_api_/",
             "/_ssl_gstatic_/", "/_static_/", "/_static/", "/_lh3_/", "/_lh3_usercontent_/", "/_gg_/"
         ]) or any(
@@ -1088,12 +1216,20 @@ class FastProxyHandler(BaseHTTPRequestHandler):
             forward_headers["Content-Type"] = ct
         # 关键：Google 的 RPC 靠 Authorization: SAPISIDHASH（浏览器按 Cookie 实时签名）区分登录/游客。
         # 这个头必须原样转发，丢了就会「读得到历史、写是游客态」（降智 + 会话不保存）。
+        _rng = self.headers.get("Range")
+        if _rng:
+            forward_headers["Range"] = _rng
         authz = self.headers.get("Authorization")
         if authz:
             forward_headers["Authorization"] = authz
         sys.stderr.write(f"[AUTH] {method} {path[:60]} auth={'YES ' + authz[:22] if authz else 'NO'}\n")
 
         # 流式原样直通：StreamGenerate 打字机 + 所有 batchexecute RPC（RPC 响应禁止重写，否则破坏前端状态）
+        # 2026-10-29: 媒体下载**不能**走手工 chunked 分支：
+        #   上游 gzip/br 被 httpx 解压后，手工声明的 Content-Length 与实际字节数不符，
+        #   Caddy 转 h2 时直接判协议错误（浏览器 ERR_HTTP2_PROTOCOL_ERROR）。
+        #   这里让它走普通分支：读全量 → 按 len(body) 声明长度，必然一致；
+        #   Range/206 由普通分支自身透传（body 即片段长度）。
         is_stream = any(k in path for k in [
             "StreamGenerate", "assistant.lamda", "batchexecute",
             # WebChannel 长连接（geminiweb-pa）必须逐帧透传；缓冲会让前端收不到「会话已建立」的帧，
@@ -1115,29 +1251,48 @@ class FastProxyHandler(BaseHTTPRequestHandler):
                     for k, v in resp.headers.items():
                         if k.lower() not in skip_headers:
                             self.send_header(k, v)
-                    # 显式声明 chunked
-                    self.send_header("Transfer-Encoding", "chunked")
+                    # 2026-10-29: 媒体下载（视频/图片）走 206/Content-Length 直通，
+                    # 只有真·增量流（无 CL）才用 chunked —— 否则播放器/下载器进度条会失效。
+                    _cl = resp.headers.get("content-length")
+                    if _cl and resp.status_code in (200, 206):
+                        self.send_header("Content-Length", _cl)
+                        _use_chunked = False
+                    else:
+                        self.send_header("Transfer-Encoding", "chunked")
+                        _use_chunked = True
                     self.send_header("Access-Control-Allow-Origin", f"https://{DOMAIN}")
                     self.send_header("Access-Control-Allow-Credentials", "true")
                     self.end_headers()
 
                     try:
-                        for chunk in resp.iter_bytes(chunk_size=4096):
+                        _first_byte_ms = None
+                        _t0 = time.time()
+                        # 2026-10-29: 原 chunk_size=4096 会让 ByteChunker 攒满 4KB 才吐，
+                        # 思考期的几百字节增量帧被压住 → 前端「一直转圈」；改成 1 即收即转。
+                        for chunk in resp.iter_bytes(chunk_size=1):
                             if chunk:
+                                if _first_byte_ms is None:
+                                    _first_byte_ms = int((time.time() - _t0) * 1000)
                                 # ⚠️ 流式响应是「长度前缀 + JSON」的二进制帧（rt=c），
                                 # 任何字节替换都会让长度前缀与实际不符 → 前端流解析崩溃（图片类会话白屏）。
                                 # 因此这里必须原样透传，URL 重写交给前端 shim 处理。
                                 # 标准 HTTP/1.1 分块：<hex_length>\r\n<data>\r\n
-                                chunk_header = f"{len(chunk):X}\r\n".encode("ascii")
-                                self.wfile.write(chunk_header + chunk + b"\r\n")
+                                if _use_chunked:
+                                    chunk_header = f"{len(chunk):X}\r\n".encode("ascii")
+                                    self.wfile.write(chunk_header + chunk + b"\r\n")
+                                else:
+                                    self.wfile.write(chunk)
                                 self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                     finally:
+                        sys.stderr.write(f"[STREAM] {path[:40]} first_byte={_first_byte_ms}ms "
+                                         f"total={int((time.time()-_t0)*1000)}ms\n")
                         try:
-                            # 🔴 终结分块：RFC 规范必须发送 0\r\n\r\n 结束帧，彻底杜绝客户端无限 pending！
-                            self.wfile.write(b"0\r\n\r\n")
-                            self.wfile.flush()
+                            if _use_chunked:
+                                # 🔴 终结分块：RFC 规范必须发送 0\r\n\r\n 结束帧，杜绝无限 pending
+                                self.wfile.write(b"0\r\n\r\n")
+                                self.wfile.flush()
                         except Exception:
                             pass
                 return
@@ -1187,7 +1342,7 @@ class FastProxyHandler(BaseHTTPRequestHandler):
                                 return f"https://{DOMAIN}"
                             return f"https://{DOMAIN}/_gg_/{h}"
                         val2 = re.sub(
-                            r"https://([a-z0-9.-]+\.(?:google\.com|google\.co\.[a-z]{2}|googleusercontent\.com|googleapis\.com|gstatic\.com|google\.app))",
+                            r"https://([a-z0-9.-]+\.(?:google\.co\.[a-z]{2}|google\.com\.[a-z]{2}|google\.com|googleusercontent\.com|usercontent\.goog|googleapis\.com|gstatic\.com|google\.app))",
                             _one, val)
                         return f"{attr}={quote}{val2}{quote}"
 
