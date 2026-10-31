@@ -101,6 +101,48 @@ def make_sapisidhash(sapisid, origin):
 
 ---
 
+## 12. 第三方统计脚本：CSP 拦得住，但 `dns-prefetch` 拦不住
+
+页面里常带 GTM / analytics / doubleclick。三种加载通道，**只有第三种能被服务端一次解决**：
+
+| 通道 | 形态 | JS 侧 hook 能否拦 |
+|---|---|---|
+| 动态插入 | `createElement('script')` + `script.src = url` | ✅ 需要**专门**拦 `HTMLScriptElement.prototype.src` 的 setter |
+| 动态插入 | `setAttribute('src', url)` | ✅ 拦 `Element.prototype.setAttribute` |
+| **解析期标签** | HTML 里直接写的 `<script async src="...">` | ❌ 全部绕开，浏览器解析时直接建元素 |
+
+最容易漏的是第一种：`setAttribute` 补丁对 `script.src = x` **完全无效**（属性 setter 不经过 `setAttribute`）。而 Google 的 jsloader（`PendingScript` / `_.Cja.load`）正是这么干的。
+
+**症状**：CSP 确实拦住了（违规请求连 DNS 都不发），但 console 一片红字：
+
+```
+Refused to load the script 'https://www.googletagmanager.com/gtm.js?id=GTM-XXXX'
+because it violates ... "script-src 'self' ..."
+```
+
+还会连带上层组件报 `No ID or name found in config.`（脚本没执行，全局对象不存在）。
+
+**修法（服务端改写 + 同源空桩）**：把命中的 `<script src>` 换成同源空端点 `/__mock_js__`，返回一段定义 `dataLayer` / `gtag` / `google_tag_manager` 的空 JS。同源不违反 CSP、`onload` 照常触发、依旧零外连，console 也干净了。
+
+```python
+_TELEMETRY_SRC_RE = re.compile(
+    r'(<script\b[^>]*?\bsrc\s*=\s*)(["\'])(?:https?:)?//(?:[a-z0-9.-]+\.)?'
+    r'(?:googletagmanager\.com|google-analytics\.com|googlesyndication\.com|'
+    r'googleadservices\.com|doubleclick\.net)(?:[^"\']*)\2', re.I)
+```
+
+**⚠️ 真正的 DNS 泄露点，CSP 根本管不到**：
+
+```html
+<link rel="dns-prefetch" href="https://www.googletagmanager.com">
+```
+
+CSP 只约束「取资源」，不约束 DNS 预解析 —— 浏览器会老老实实去解析这个域名。想做到「零 Google DNS」，必须把 `rel="dns-prefetch"` / `rel="preconnect"` 里未改写成同源的外域 hint **整条删掉**（已指向本站的保留，同源预连接是有益的）。
+
+> 顺序坑：通用的"把 Google 域改写成 `/_gg_/` 前缀"那条正则，通常只白名单 `google.com` / `gstatic.com` 家族，`googletagmanager.com`、`doubleclick.net` **不在名单里会被原样留下** → 交给 CSP 硬拦。所以这两个清理必须在通用改写**之后**单独跑一遍。
+
+---
+
 ## 7. 生态坑：临时目录被核心清理机制删掉
 
 某 bot 框架的核心自带临时目录清理器（超配额按最旧删文件），删完还会**把清空的子目录 rmdir 掉**；而插件保存文件时不重建目录 → 偶发"No such file or directory"、重启即愈、循环复发。修法：保存前 `os.makedirs(..., exist_ok=True)`。凡是"写临时目录"的插件都要防这一手。

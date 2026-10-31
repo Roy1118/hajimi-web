@@ -82,6 +82,7 @@ systemd / Caddy / 隧道示例见 [`deploy/`](deploy/)。
 
 ## 文档
 
+- **[逆向手册（7 篇）](docs/playbook/01-overview-and-topology.md)** —— 把一个网页版应用逆向成私人镜像站的完整方法论：四层模型、每层「现象 / 根因 / 修法 / 验证」、新站点迁移 SOP、症状速查表。换个站点也能照着做
 - [踩坑笔记 LESSONS.md](docs/LESSONS.md) —— 请求签名、CSP 治理、轮换真空窗、上传协议、凭据保活闭环设计的完整还原过程
 
 ## License

@@ -441,7 +441,11 @@ SHIELD_SCRIPT = f"""<script>
             var n = name.toLowerCase();
             if (n === "src" || n === "href" || n === "srcset" || n === "style") {{
                 if (isBlocked(val)) {{
-                    val = "about:blank";
+                    // 2026-10-31: <script src> 不能塞 about:blank（会报 Failed to load resource
+                    // 且 onload 不触发），改走同源空桩，见 7.5。
+                    val = (this && this.tagName === "SCRIPT")
+                        ? origin + "/__mock_js__"
+                        : "about:blank";
                 }} else {{
                     val = mapUrl(val);
                 }}
@@ -449,6 +453,38 @@ SHIELD_SCRIPT = f"""<script>
         }}
         return origSetAttr.call(this, name, val);
     }};
+
+    // 7.5 Intercept HTMLScriptElement.src (2026-10-31)
+    //     Google 的 jsloader（PendingScript / _.Cja.load）是直接给 script.src 赋值，
+    //     根本不经过 setAttribute，所以 7 号补丁管不到它。之前只能靠 CSP 硬拦：
+    //     虽然确实没出网（CSP 违规连 DNS 都不发），但 console 一片红字，
+    //     连带 GTM/viewability 组件报 "No ID or name found in config"。
+    //     这里把「已被黑名单命中的」脚本换成本站空桩：同源不违反 CSP、
+    //     onload 照常触发、依旧零外连。
+    //     ⚠️ 非黑名单 URL 一律原样透传，不做 mapUrl —— 绝不改动现有正常加载链路。
+    (function() {{
+        var sd = null;
+        try {{ sd = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src"); }} catch(e) {{}}
+        if (!sd || !sd.set) return;
+        Object.defineProperty(HTMLScriptElement.prototype, "src", {{
+            configurable: true,
+            set: function(val) {{
+                try {{
+                    if (isBlocked(val)) {{
+                        try {{
+                            var m = String(val).match(/[?&]id=(GTM-[A-Za-z0-9]+)/);
+                            if (m) (window.__hajGtmIds = window.__hajGtmIds || []).push(m[1]);
+                            (window.__shieldLog = window.__shieldLog || []).push(
+                                "SCRIPT-BLOCK " + String(val).slice(0, 90));
+                        }} catch(e2) {{}}
+                        val = origin + "/__mock_js__";
+                    }}
+                }} catch(e3) {{}}
+                return sd.set.call(this, val);
+            }},
+            get: function() {{ return sd.get.call(this); }}
+        }});
+    }})();
 
     // 8. Intercept CSSStyleDeclaration
     var origSetProp = CSSStyleDeclaration.prototype.setProperty;
@@ -755,6 +791,77 @@ LOGIN_PAGE = """<!DOCTYPE html>
 
 MOCK_RESPONSE_BODY = b'{"status":"ok","code":200,"nextRequestWaitMillis":"86400000","response":{}}'
 
+# 2026-10-31: 第三方脚本（GTM / analytics / doubleclick）空桩。
+# 被 CSP 拦掉的 <script> 请求改指向本端点：同源、零外连，但 onload 正常触发，
+# 同时补齐 GTM/gtag 的全局对象，避免上层组件因为「脚本没加载」连带报错。
+MOCK_JS_BODY = b"""/* hajimi mock: third-party analytics stub. never leaves this origin. */
+(function(){
+  try {
+    var dl = window.dataLayer = window.dataLayer || [];
+    window.gtag = window.gtag || function(){ dl.push(arguments); };
+    window.ga = window.ga || function(){};
+    window.gaplugins = window.gaplugins || {};
+    window.google_analytics_domain_name = window.google_analytics_domain_name || "none";
+    var gtm = window.google_tag_manager = window.google_tag_manager || {};
+    var ids = window.__hajGtmIds || [];
+    var stub = function(){
+      return {
+        dataLayer: { get: function(){ return undefined; }, set: function(){} },
+        get: function(){ return undefined; },
+        reset: function(){}
+      };
+    };
+    for (var i = 0; i < ids.length; i++) {
+      if (!gtm[ids[i]]) gtm[ids[i]] = stub();
+    }
+  } catch (e) {}
+})();
+"""
+
+# ── 2026-10-31: HTML 解析期的外域遥测/统计资源清理 ────────────────────
+# 为什么必须放在服务端：<script async src="https://www.googletagmanager.com/gtm.js?id=...">
+# 是浏览器**解析 HTML 时就建元素**的，createElement / script.src 赋值 / setAttribute
+# 三种 JS 侧 hook 全部绕开，只有 CSP 拦得住。拦是拦住了（违规请求连 DNS 都不发），
+# 代价是 console 一片红字，GTM 组件还连带报 "No ID or name found in config"。
+# 这里直接把 src 换成本站空桩：同样零外连，但页面干净、onload 也正常触发。
+_TELEMETRY_SRC_RE = re.compile(
+    r'(<script\b[^>]*?\bsrc\s*=\s*)(["\'])(?:https?:)?//(?:[a-z0-9.-]+\.)?'
+    r'(?:googletagmanager\.com|google-analytics\.com|googlesyndication\.com|'
+    r'googleadservices\.com|doubleclick\.net)(?:[^"\']*)\2',
+    re.I)
+
+# ⚠️ 真正的 DNS 泄露点（CSP 管不到）：<link rel="dns-prefetch" href="https://www.googletagmanager.com">
+# CSP 只约束「取资源」，不约束 DNS 预解析 —— 浏览器会老老实实去解析这个域名。
+# 凡是没被改写成同源 /_gg_/ 的外域 hint，整条删掉。
+_LINK_HINT_RE = re.compile(
+    r'<link\b[^>]*\brel\s*=\s*["\']?(?:dns-prefetch|preconnect)["\']?[^>]*>',
+    re.I)
+
+def _strip_telemetry_scripts(text):
+    if not text:
+        return text
+    return _TELEMETRY_SRC_RE.sub(lambda m: f'{m.group(1)}"/__mock_js__"', text)
+
+def _strip_ext_link_hints(text):
+    if not text:
+        return text
+    def _f(m):
+        tag = m.group(0)
+        hm = re.search(r'\bhref\s*=\s*(["\'])(.*?)\1', tag, re.I)
+        if not hm:
+            return tag
+        href = hm.group(2).strip()
+        try:
+            if DOMAIN and DOMAIN in href:
+                return tag          # 已指向本站，保留（同源预连接是有益的）
+        except Exception:
+            pass
+        # 外域绝对地址 / 协议相对地址 → 丢弃
+        if re.match(r'^(?:https?:)?//', href, re.I):
+            return ''
+        return tag
+    return _LINK_HINT_RE.sub(_f, text)
+
 def remap_google_url(u):
     """把任意 Google 资源 URL 改写成本机代理路径，用于 Location 头等无法用 shim 处理的地方。"""
     if not u:
@@ -799,7 +906,7 @@ class FastProxyHandler(BaseHTTPRequestHandler):
         if not any(self.path.startswith(p) for p in [
             "/_gstatic_/", "/_www_gstatic_/", "/_fonts_gstatic_/", "/_fonts_api_/",
             "/_ssl_gstatic_/", "/_static_/", "/_static/", "/_lh3_/", "/_lh3_usercontent_/", "/_gg_/",
-            "/__mock_ok__", "/favicon.ico"
+            "/__mock_ok__", "/__mock_js__", "/favicon.ico"
         ]):
             sys.stderr.write(f"[{self.date_time_string()}] {fmt % args}\n")
 
@@ -971,6 +1078,18 @@ class FastProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Credentials", "true")
             self.end_headers()
             self.wfile.write(MOCK_RESPONSE_BODY)
+            self.wfile.flush()
+            return
+
+        # 2026-10-31: 第三方脚本空桩（GTM / analytics / doubleclick）。
+        # SHIELD 的 script.src 拦截面把命中的外域脚本指到这里：同源、零外连、onload 正常。
+        if parsed.path == "/__mock_js__":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(MOCK_JS_BODY)))
+            self.end_headers()
+            self.wfile.write(MOCK_JS_BODY)
             self.wfile.flush()
             return
 
@@ -1349,6 +1468,11 @@ class FastProxyHandler(BaseHTTPRequestHandler):
                     text = re.sub(
                         r"\b(href|src|action|srcset|poster)=(['\"])([^'\"]+)\2",
                         _remap_attr, text)
+                    # 2026-10-31: 上面那条通用改写按 *google.com / gstatic 白名单走，
+                    # googletagmanager.com / doubleclick.net 不在名单里，会原样留下 →
+                    # 交给 CSP 硬拦（console 红字）。这里显式清理一遍。
+                    text = _strip_telemetry_scripts(text)
+                    text = _strip_ext_link_hints(text)
                     # 注入客户端补丁（fetch/XHR/img/srcset/CSS/CSSOM/ShadowDOM/SW 等）
                     if "<head>" in text:
                         text = text.replace("<head>", "<head>" + ACTIVE_SHIELD, 1)
