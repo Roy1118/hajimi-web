@@ -143,6 +143,30 @@ CSP 只约束「取资源」，不约束 DNS 预解析 —— 浏览器会老老
 
 ---
 
+## 13. 流式输出卡"思考中"的隐藏凶手：`Accept-Encoding: gzip`
+
+**症状**：已调 `chunk_size=1` 且前置关了缓冲，普通回复能打字机输出，但「思考中 / 正在搜索网络」等几十字节增量状态帧仍被压住几十秒不吐。
+
+**根因**：代理客户端默认向 Google 上游发 `Accept-Encoding: gzip`。上游在 gzip 压缩下不会对几十字节的增量小帧立即 flush，加上客户端 `zlib` 解压器内部攒缓冲，导致状态帧迟迟到不了浏览器。
+
+**修法**：所有流式端点（`StreamGenerate`、`batchexecute`、`processSession`、`geminiweb_pa`）与媒体下载统一显式发送 `Accept-Encoding: identity`，拿到原生未压缩 chunk 即收即转；压缩仅由入口 Caddy 对 HTML 与静态资源开启。
+
+---
+
+## 14. 遥测/信令桩不能乱回 JSON
+
+1. **`google.internal.waa` 遥测**：前端用 protobuf 解析响应，mock 回 JSON 会触发 `Error when deserializing response data`，必须回空 `application/x-protobuf`（`Content-Length: 0`）。
+2. **`punctual/v1/chooseServer` 时钟同步 RPC**：它不是可忽略的统计打点；若 mock 成假 JSON，前端解析失败后会进入 5~10 分钟指数退避重试，表现为发消息后长久转圈并回退新对话页，必须走真代理透传。
+
+---
+
+## 15. 内存/磁盘缓存上限、原子写与流式建连重试
+
+- **大 JS bundle 被内存上限拒之门外**：Google 前端主 JS 已膨胀到 6~9 MB，默认 `4 MB` 单条上限与 `64 MB` 总上限会让这些核心文件永远 `cache=miss`。把 `MIRROR_MEM_CACHE_ENTRY_KB` 放宽到 `12288`（12 MB）、`MIRROR_MEM_CACHE_MB` 设为 `192` 可直接放进内存；磁盘写采用先 `*.tmp.<pid>.<tid>` 后 `os.replace` 原子替换（先 data 后 meta），启动时自愈孤儿临时文件。
+- **流式接口建连偶发 TLS EOF**：复用连接池偶发遇到 `httpx.ConnectError: [SSL: UNEXPECTED_EOF_WHILE_READING]`。流式分支只应在**尚未拿到响应头（`__enter__()`）前**做 1 次安全重连，拿到响应头之后若断流绝不重放，避免重复扣额或生成。
+
+---
+
 ## 7. 生态坑：临时目录被核心清理机制删掉
 
 某 bot 框架的核心自带临时目录清理器（超配额按最旧删文件），删完还会**把清空的子目录 rmdir 掉**；而插件保存文件时不重建目录 → 偶发"No such file or directory"、重启即愈、循环复发。修法：保存前 `os.makedirs(..., exist_ok=True)`。凡是"写临时目录"的插件都要防这一手。

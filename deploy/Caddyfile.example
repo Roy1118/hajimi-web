@@ -8,6 +8,11 @@
 
 hajimi.example.com:8443 {
     tls /etc/caddy/certs/example.com.pem /etc/caddy/certs/example.com.key
+
+    # 静态与 HTML 压缩；流式 RPC 排除，避免压缩/缓冲影响打字机实时性
+    @compressible not path /_geminiweb_pa_/* /_/BardChatUi/*
+    encode @compressible zstd gzip
+
     reverse_proxy 127.0.0.1:8325 {
         # 关键：流式通道必须不缓冲，否则前端一直转圈
         flush_interval -1

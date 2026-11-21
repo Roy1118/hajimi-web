@@ -37,11 +37,11 @@ flowchart LR
 - **全套客户端头转发**：`x-goog-*`（客户端身份 + 上传协议）原样转发
 - **内容安全策略治理**：重写上游 CSP 为可用白名单，注入 setter 补丁兼容前端动态资源加载
 - **双链路**：云主机隧道中转 + 入口 SNI 复用直连（家宽全速，零路由器改动加新站点）
-- **访问控制**：口令登录 + HMAC token（30 天有效期）
-- **资源缓存**：静态资源本地缓存目录，二次加载飞快
-- **媒体代理**：视频/图片下载与播放全走本站（支持 `Range` / `206` 断点续传，不直连上游媒体域）
-- **交互式内容**：AI Studio Applet（iframe）与地区域名（`google.co.kr` 等）、`.goog` 域一并改写代理
-- **流式零缓冲**：增量帧收到即转发，深度思考期间界面持续有反馈
+- **访问控制与多账号**：口令登录 + `account.ts.hmac` 签名 token（30 天有效期，防爆破限速 + 私有主机强制鉴权），支持可选 `HAJIMI_ALT_PWD` + `MIRROR_ALT_PROFILE` 双账号独立 Cookie 分流
+- **分层资源缓存**：`_BoundedLRU` 内存缓存（可配上限以容纳大体积 JS bundle）+ 原子写磁盘缓存，静态资源二次加载零回源
+- **流式零缓冲与大文件直通**：增量流显式声明 `Accept-Encoding: identity` 防止上游 gzip 缓冲导致“卡思考”，支持建连阶段 TLS 闪断自动重试；>2MB 大文件上传与媒体下载走真流式（`Range`/`206`），低内存占用
+- **媒体代理**：视频/图片下载与播放全走本站（不直连上游媒体域）
+- **交互式内容**：AI Studio Applet（iframe）与地区域名（`google.co.kr` 等）、`.goog` 域一并改写代理；第三方统计脚本同源空桩替换并清理外域 `dns-prefetch`
 
 ## 快速开始
 
@@ -66,11 +66,13 @@ systemd / Caddy / 隧道示例见 [`deploy/`](deploy/)。
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `MIRROR_DOMAIN` | `hajimi.example.com` | 入口域名（用于 Cookie 域与签名 origin） |
-| `MIRROR_PORT` | `8322` | 监听端口 |
+| `MIRROR_PORT` | `8324` | 监听端口 |
 | `MIRROR_CACHE` | `./cache` | 静态资源缓存目录 |
-| `HAJIMI_PWD` | 无 | 访问口令（未设置则不启用鉴权） |
+| `HAJIMI_PWD` | 无 | 主账号访问口令（未设置则不启用鉴权；支持通过 `HAJIMI_ALT_PWD` + `MIRROR_ALT_PROFILE` 启用双账号） |
 | `FIREFOX_PROFILE` | `/home/admin/.mozilla/firefox-gemini` | 专用浏览器 profile（凭据来源） |
 | `UPSTREAM_PROXY` | `http://127.0.0.1:7890` | 上游通道地址 |
+| `MIRROR_MEM_CACHE_MB` | `64` | 内存 LRU 缓存总上限（MB），推荐 `192` |
+| `MIRROR_MEM_CACHE_ENTRY_KB` | `4096` | 单条进内存缓存的最大体积（KB），要缓存 6–9MB 主脚本可设为 `12288` |
 | `DIRECT_TLS_PORT` | `8322` | 直连入口端口（可选，默认关闭） |
 | `DIRECT_TLS_CERT` / `DIRECT_TLS_KEY` | `certs/*.pem` | 直连入口证书 |
 

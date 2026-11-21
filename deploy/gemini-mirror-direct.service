@@ -8,6 +8,8 @@ Type=simple
 Environment=MIRROR_DOMAIN=hajimi-direct.example.com
 Environment=MIRROR_PORT=8325
 Environment=MIRROR_CACHE=/opt/hajimi/cache-direct
+Environment=MIRROR_MEM_CACHE_MB=192
+Environment=MIRROR_MEM_CACHE_ENTRY_KB=12288
 Environment=HAJIMI_PWD=change-me
 Environment=FIREFOX_PROFILE=/home/admin/.mozilla/firefox-gemini
 Environment=UPSTREAM_PROXY=http://127.0.0.1:7890
